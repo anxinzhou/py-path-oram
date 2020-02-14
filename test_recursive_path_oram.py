@@ -1,4 +1,4 @@
-from non_recursive_path_oram import PathOramClient, PathOramServer
+from recursive_path_oram import RecursivePathOramClient, RecursivePathOramServer
 import os
 from math import log
 import time
@@ -35,10 +35,10 @@ print("total files", total_file_number)
 print("level of oram", level)
 
 start = time.time()
-client = PathOramClient(level)
+client = RecursivePathOramClient(level)
 # generate dummy block
 dummy_buckets = client.generate_initialize_block()
-server = PathOramServer(dummy_buckets, level)
+server = RecursivePathOramServer(dummy_buckets)
 end = time.time()
 print("time of initialize with dummy", end - start, 's')
 

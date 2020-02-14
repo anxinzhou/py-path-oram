@@ -1,86 +1,7 @@
-from random import randint, shuffle, sample
+from random import randint
 from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
 from bisect import bisect_left
-
-# currently files are stored in memory of server
-class BlockCipher:
-    def __init__(self, cipher, nonce):
-        self.cipher = cipher
-        self.nonce = nonce
-
-
-class BlockPlaintext:
-    def __init__(self, block_id, data):
-        self.block_id = block_id
-        self.data = data
-
-    def all(self):
-        return self.block_id + self.data
-
-
-class Bucket:
-    def __init__(self, blocks):
-        if blocks is None:
-            self.data = []
-        else:
-            self.check_blocks_type(blocks)
-            self.data = blocks
-
-    def get(self):
-        data = self.data
-        # clear
-        return data
-
-    def put(self, blocks):
-        self.check_blocks_type(blocks)
-        self.data = blocks
-
-    def check_blocks_type(cls, blocks):
-        if type(blocks) is not list:
-            raise Exception("wrong type of blocks passed to bucket")
-
-
-class OramTree:
-    def __init__(self, buckets):  # store tree in an array
-        self.buckets = buckets
-        self.root = None if not buckets or len(buckets) == 0 else buckets[0]
-
-    # assume position is 0,1 string
-    def read(self, position):
-        blocks = []
-        if not self.root:
-            return blocks
-
-        blocks.extend(self.buckets[0].get())
-
-        target_index = 0
-        for i in range(len(position)):
-            if position[i] == '0':  # turn left
-                target_index = 2 * i + 1
-            elif position[i] == '1':  # turn right
-                target_index = 2 * i + 2
-            else:
-                raise Exception("position should only be 0,1 string")
-            target_bucket = self.buckets[target_index]
-            blocks.extend(target_bucket.get())
-        return blocks
-
-    def write(self, position, blocks, level):
-        if self.root == None:
-            raise Exception("write to empty oram tree")
-            # check validity of level
-
-        target_index = 0
-        for i in range(level):
-            if position[i] == '0':  # turn left
-                target_index = 2 * i + 1
-            elif position[i] == '1':  # turn rightddasd
-                target_index = 2 * i + 2
-            else:
-                raise Exception("position should only be 0,1 string")
-        target_bucket = self.buckets[target_index]
-        target_bucket.put(blocks)
+from oram_tree import BlockCipher, BlockPlaintext, Bucket, OramTree
 
 
 class PathOramServer:
@@ -97,16 +18,12 @@ class PathOramServer:
     # block dummy symbol used to pad a file to the maximum size which is (block_size - block_id_size)
     #
 
-    def __init__(self, buckets, level, Z=5, block_size=2048, block_id_size=32, block_dummy_symbol='#'):
-        self.Z = Z
+    def __init__(self, buckets, level):
         self.level = level
-        self.block_size = block_size
-        self.block_id_size = block_id_size
-        self.total_bucket_number = pow(2, level + 1) - 1
-        self.block_dummy_symbol = block_dummy_symbol
 
         # init with random blocks
-        if len(buckets) != self.total_bucket_number:
+        total_bucket_number = pow(2, level + 1) - 1
+        if len(buckets) != total_bucket_number:
             raise Exception("number of blocks should equal to total_bucket_number")
         self.oram_tree = OramTree(buckets)
 
@@ -148,9 +65,9 @@ class PathOramClient:
         self.stash = dict()  # {block_id: block plaintext)}
         self.position_map = dict()  # {block_id:  position}
 
-        total_real_block = pow(2, level) - 1
-        for i in range(total_real_block):
-            position = self.integer_to_position(randint(0, total_real_block))
+        leaf_nodes = pow(2, level)
+        for i in range(leaf_nodes):
+            position = self.integer_to_position(randint(0, leaf_nodes))
             self.position_map[i] = position
         # use AES for encryption
         self.key = str.encode('1' * (self.key_size // 8))
@@ -165,7 +82,7 @@ class PathOramClient:
 
     def access(self, op, block_id, block_data, oram_server):
         block_position = self.position_map[block_id]
-        total_real_block = pow(2, self.level) - 1
+        total_real_block = pow(2, self.level)
         self.position_map[block_id] = self.integer_to_position(randint(0, total_real_block))
 
         # read bucket along path block_position from server
@@ -230,12 +147,6 @@ class PathOramClient:
         return data_to_read
 
     def remove_dummy_in_block(self, data):
-        # # a simple binary search to find first occurence of dummy
-        # lo = 0
-        # hi = len(data)
-        # while lo<hi:
-        #     mid = (lo+hi)>>1
-        #     mid_value = int.from_bytes(data[mid],byteorder='little')
         dummy_symbol = self.block_dummy_symbol
         dummy_symbol_value = dummy_symbol[0]
         first_dummy_index = bisect_left(data, dummy_symbol_value)
@@ -263,12 +174,7 @@ class PathOramClient:
         return BlockPlaintext(block_id, data)
 
     def generate_initialize_block(self):
-        blocks = [[0] * self.Z for i in range(self.total_bucket_number)]
-
-        for i in range(self.total_bucket_number):
-            for j in range(self.Z):
-                block = self.generate_dummy_block_cipher()
-                blocks[i][j] = block
+        blocks = [[self.generate_dummy_block_cipher()] * self.Z for i in range(self.total_bucket_number)]
         buckets = []
         for i in range(len(blocks)):
             bucket = Bucket(blocks[i])
