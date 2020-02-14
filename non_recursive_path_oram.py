@@ -1,8 +1,7 @@
 from random import randint, shuffle, sample
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
-import util
-
+from bisect import bisect_left
 
 # currently files are stored in memory of server
 class BlockCipher:
@@ -70,14 +69,10 @@ class OramTree:
     def write(self, position, blocks, level):
         if self.root == None:
             raise Exception("write to empty oram tree")
-        if level > len(self.buckets):
-            raise Exception("level greater than tree depth")
             # check validity of level
-        if level > len(position):
-            raise Exception("the length of level is greater than position map")
 
         target_index = 0
-        for i in range(level - 1):
+        for i in range(level):
             if position[i] == '0':  # turn left
                 target_index = 2 * i + 1
             elif position[i] == '1':  # turn rightddasd
@@ -107,7 +102,7 @@ class PathOramServer:
         self.level = level
         self.block_size = block_size
         self.block_id_size = block_id_size
-        self.total_bucket_number = pow(2, level - 1)
+        self.total_bucket_number = pow(2, level + 1) - 1
         self.block_dummy_symbol = block_dummy_symbol
 
         # init with random blocks
@@ -124,9 +119,8 @@ class PathOramServer:
         return self.oram_tree.write(position, blocks, level)
 
     def check_position_length(self, position):
-        if len(position) != self.level - 1:
-            raise Exception("wrong length of position", "length of position", len(position), "should be",
-                            self.level - 1)
+        if len(position) < self.level:
+            raise Exception("level should be less or equal than length of position")
 
 
 class PathOramClient:
@@ -142,17 +136,22 @@ class PathOramClient:
     # A file could be stored in multiple block,  a mapping between file and block_id could be stored in client
     #
     # block dummy symbol used to pad a file to the maximum size which is (block_size - block_id_size)
-    def __init__(self, level, Z=5, block_size=2048, block_id_size=32, block_dummy_symbol='#'):
+    def __init__(self, level, Z=5, block_size=8192, block_id_size=32):
         self.Z = Z
         self.level = level
         self.block_size = block_size
         self.block_id_size = block_id_size
-        self.total_bucket_number = pow(2, level - 1)
-        self.block_dummy_symbol = block_dummy_symbol
+        self.total_bucket_number = pow(2, level + 1) - 1
+        self.block_dummy_symbol = b'\xff'
+        self.dummy_block_id = int.from_bytes(self.block_dummy_symbol * self.block_id_size, byteorder='little')
 
         self.stash = dict()  # {block_id: block plaintext)}
         self.position_map = dict()  # {block_id:  position}
 
+        total_real_block = pow(2, level) - 1
+        for i in range(total_real_block):
+            position = self.integer_to_position(randint(0, total_real_block))
+            self.position_map[i] = position
         # use AES for encryption
         self.key = str.encode('1' * (self.key_size // 8))
 
@@ -166,25 +165,37 @@ class PathOramClient:
 
     def access(self, op, block_id, block_data, oram_server):
         block_position = self.position_map[block_id]
-        self.position_map[block_id] = self.integer_to_position(randint(0, self.total_bucket_number - 1))
+        total_real_block = pow(2, self.level) - 1
+        self.position_map[block_id] = self.integer_to_position(randint(0, total_real_block))
 
         # read bucket along path block_position from server
         blocks_cipher = oram_server.read(block_position)
         to_append_stash = dict()
         for block_cipher in blocks_cipher:
             block_plaintext = self.decrypt_block(block_cipher)
+            # skip dummy block
+            if block_plaintext.block_id == self.dummy_block_id:
+                continue
             to_append_stash[block_plaintext.block_id] = block_plaintext
 
         # update stash
         self.stash.update(to_append_stash)
-        block_plaintext_to_read = self.stash[block_id]  # read from stash a
-        data_to_read = self.remove_dummy_in_block(block_plaintext_to_read.data)
+
+        if block_id not in self.stash:
+            # not write before
+            data_to_read = None
+        else:
+            block_plaintext_to_read = self.stash[block_id]  # read from stash a
+            data_to_read = self.remove_dummy_in_block(block_plaintext_to_read.data)
         if op == 'write':
             # pad block data to maximum block_size
-            util.suffix_pad_dummy(block_data, self.block_size, dummy_symbol=self.block_dummy_symbol)
+            if len(block_data) > self.block_size:
+                raise Exception("length of block data should be less than block size", "length of block data:",
+                                len(block_data), "block size:", self.block_size)
+            block_data = block_data + (self.block_size - len(block_data)) * self.block_dummy_symbol
             self.stash[block_id] = BlockPlaintext(block_id, block_data)
 
-        for l in reversed(range(self.level)):
+        for l in reversed(range(self.level + 1)):
             intersect_block = self.find_intersection_block(block_position, l)
             # select S'= min(len(intersect_block),Z) blocks to write
             select_block_num = min(len(intersect_block), self.Z)
@@ -209,12 +220,9 @@ class PathOramClient:
 
             # padded S' with dummy blocks to size of Z, block id should be selected from stash
             if len(select_blocks_cipher) < self.Z:
-                print("length of stash",len(self.stash.keys()),"length of to pad block", self.Z - len(select_blocks_cipher))
-                dummy_blocks_id = sample(self.stash.keys(), self.Z - len(select_blocks_cipher))
                 dummy_blocks_cipher = []
                 for i in range(0, self.Z - len(select_blocks_cipher)):
-                    dummy_block_id = dummy_blocks_id[i]
-                    dummy_block_cipher = self.generate_dummy_block_cipher(dummy_block_id)
+                    dummy_block_cipher = self.generate_dummy_block_cipher()
                     dummy_blocks_cipher.append(dummy_block_cipher)
                 select_blocks_cipher.extend(dummy_blocks_cipher)
             oram_server.write_bucket(block_position, select_blocks_cipher, l)
@@ -222,15 +230,19 @@ class PathOramClient:
         return data_to_read
 
     def remove_dummy_in_block(self, data):
+        # # a simple binary search to find first occurence of dummy
+        # lo = 0
+        # hi = len(data)
+        # while lo<hi:
+        #     mid = (lo+hi)>>1
+        #     mid_value = int.from_bytes(data[mid],byteorder='little')
         dummy_symbol = self.block_dummy_symbol
-        last_index = len(data) - 1
-        for i in reversed(range(len(data))):
-            if data[i] != dummy_symbol:
-                last_index = i
-        return data[:last_index + 1]
+        dummy_symbol_value = dummy_symbol[0]
+        first_dummy_index = bisect_left(data, dummy_symbol_value)
+        return data[:first_dummy_index]
 
     def read(self, block_id, oram_server):
-        return self.access(op='read', block_id=block_id, oram_server=oram_server)
+        return self.access(op='read', block_data=None, block_id=block_id, oram_server=oram_server)
 
     def write(self, block_id, block_data, oram_server):
         return self.access(op='write', block_id=block_id, block_data=block_data, oram_server=oram_server)
@@ -238,44 +250,42 @@ class PathOramClient:
     def encrypt_block(self, block_plaintext):
         cipher = AES.new(self.key, AES.MODE_EAX)
         nonce = cipher.nonce
-        padded_block_id = util.prefix_pad_dummy(str(block_plaintext.block_id), self.block_id_size, dummy_symbol='0')
+        padded_block_id = block_plaintext.block_id.to_bytes(self.block_id_size, byteorder='little')
         data = padded_block_id + block_plaintext.data
-        ciphertext = cipher.encrypt(str.encode(data))
+        ciphertext = cipher.encrypt(data)
         return BlockCipher(ciphertext, nonce)
 
     def decrypt_block(self, block_cipher):
         cipher = AES.new(self.key, AES.MODE_EAX, nonce=block_cipher.nonce)
-        plain_text = cipher.decrypt(block_cipher.cipher).decode()
-        block_id = plain_text[:self.block_id_size]
+        plain_text = cipher.decrypt(block_cipher.cipher)
+        block_id = int.from_bytes(plain_text[:self.block_id_size], byteorder='little')
         data = plain_text[self.block_id_size:]
-        return BlockPlaintext(int(block_id), data)
+        return BlockPlaintext(block_id, data)
 
     def generate_initialize_block(self):
         blocks = [[0] * self.Z for i in range(self.total_bucket_number)]
-        blocks_id = list(range(self.total_bucket_number * self.Z))
-        shuffle(blocks_id)
+
         for i in range(self.total_bucket_number):
             for j in range(self.Z):
-                block_id_index = i * self.Z + j
-                block_id = blocks_id[block_id_index]
-                position = self.integer_to_position(block_id // self.Z)
-                self.position_map[block_id] = position
-                block = self.generate_dummy_block_cipher(block_id)
-                blocks[block_id // self.Z][block_id % self.Z] = block
+                block = self.generate_dummy_block_cipher()
+                blocks[i][j] = block
         buckets = []
         for i in range(len(blocks)):
             bucket = Bucket(blocks[i])
             buckets.append(bucket)
         return buckets
 
-    def generate_dummy_block_cipher(self, block_id):
-        dummy_data = '#' * (self.block_size - self.block_id_size)
-        block_cipher = self.encrypt_block(BlockPlaintext(block_id, dummy_data))
+    def generate_dummy_block_cipher(self):
+        dummy_block = self.block_dummy_symbol * self.block_size
+        dummy_block_id = int.from_bytes(dummy_block[:self.block_id_size], byteorder='little')
+        dummy_data = dummy_block[self.block_id_size: self.block_size]
+        block_cipher = self.encrypt_block(
+            BlockPlaintext(dummy_block_id, dummy_data))
         return block_cipher
 
     # change loc from 0 - 2^ level - 1 to a binary position representation in a tree (e.g. '00101')
     def integer_to_position(self, loc):
         binary_loc = bin(loc)[2:]  # remove '0b' in binary
-        position_length = self.level - 1
+        position_length = self.level
         position = ('0' * position_length + binary_loc)[-position_length:]
         return position
