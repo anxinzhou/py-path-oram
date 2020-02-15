@@ -50,25 +50,29 @@ class RecursivePathOramClient:
     # Data of position block is (block_id+position)
     # assume a position compress with 2^k for simplicity
     # we do not need to hide the size of position map block, the size could be calculated.
-    def __init__(self, first_level, Z=5, position_compress=16, block_size=8192, block_id_size=32):
+    def __init__(self, first_level, Z=4, position_compress=8, block_size=8192, block_id_size=32):
         # assume position_compress is the size of 2^k for simplicity
         if log(position_compress, 2) != int(log(position_compress, 2)):
             raise Exception("position block level should be the pow of 2")
 
         first_level_leaf_nodes = pow(2, first_level)  # real file blocks no more than this
-        recursive_level = int(log(first_level_leaf_nodes, position_compress))
+
+        recursive_level = int(log(first_level_leaf_nodes-1, position_compress))
+
         self.recursive_level = recursive_level
 
         # calculate level for all oram
         self.levels = [first_level]
         self.blocks_size = [block_size]
-        for i in range(recursive_level):
-            leaf_nodes = first_level_leaf_nodes / position_compress
+        previous_leaf_nodes = first_level_leaf_nodes
+        for i in range(1, recursive_level + 1):
+            leaf_nodes = previous_leaf_nodes / position_compress
+            position_block_size = block_id_size + self.levels[-1]
             level = int(log(leaf_nodes, 2))
             self.levels.append(level)
-            position_block_size = level + block_id_size
             self.blocks_size.append(position_block_size)
-
+            previous_leaf_nodes = leaf_nodes
+        print("all levels:", self.levels)
         self.Z = Z
         self.block_id_size = block_id_size
 
@@ -77,7 +81,7 @@ class RecursivePathOramClient:
 
         self.position_compress = position_compress  # 24
 
-        self.stash = [dict()]*(recursive_level+1)  # {block_id: block plaintext)}
+        self.stash = [dict() for i in range(recursive_level + 1)]  # {block_id: block plaintext)}
 
         self.position_map = dict()  # {block_id:  position}
 
@@ -87,28 +91,56 @@ class RecursivePathOramClient:
     def find_intersection_block(self, position, level, recursive_level, oram_server):
         intersect_block = dict()
         for block_id in self.stash[recursive_level]:
-            block_position = self.lookup_position(block_id, recursive_level, oram_server)
+            block_position = self.lookup_position_find_intersection(block_id, recursive_level + 1, oram_server)
             if block_position[:level] == position[:level]:
                 intersect_block[block_id] = self.stash[recursive_level][block_id]
         return intersect_block
 
-    def lookup_position(self, block_id, recursive_level, oram_server):
-        compressed_block_id = block_id / self.position_compress
-        leaf_nodes = pow(2, self.levels[recursive_level])
-        new_position = self.integer_to_position(randint(0, leaf_nodes), recursive_level)
-        if recursive_level == self.recursive_level:  # last level
+    def lookup_position_find_intersection(self, block_id, recursive_level, oram_server):
+        compressed_block_id = block_id // self.position_compress
+        if recursive_level == self.recursive_level + 1:  # last level
             position = self.position_map[compressed_block_id]
-            self.position_map[compressed_block_id] = new_position
         else:  # read position from recursive oram
-            data = self.read_recursively(compressed_block_id, recursive_level + 1, oram_server)
+            data = self.read_recursively(compressed_block_id, recursive_level, oram_server)
+
             # get position of target block from packed data
             block_size = self.blocks_size[recursive_level]
             if len(data) % block_size != 0:
-                raise Exception("unexpected length of data read")
+                raise Exception("unexpected length of data read", "length of data", len(data), "block size", block_size)
             found = False
             position = ''
             data_to_write = None
-            for i in range(0, len(data), block_size):
+            for i in range(0, len(data) // block_size):
+                block = data[i * block_size:(i + 1) * block_size]
+                read_block_id = int.from_bytes(block[:self.block_id_size], byteorder='little')
+                if read_block_id != block_id:
+                    continue
+                found = True
+                position = block[self.block_id_size:block_size].decode()
+                break
+            if not found:
+                raise Exception("position should be found")
+            # write new position
+        return position
+
+    def lookup_position(self, block_id, recursive_level, oram_server):
+        compressed_block_id = block_id // self.position_compress
+        leaf_nodes = pow(2, self.levels[recursive_level - 1])
+        new_position = self.integer_to_position(randint(0, leaf_nodes), recursive_level - 1)
+        if recursive_level == self.recursive_level + 1:  # last level
+            position = self.position_map[compressed_block_id]
+            self.position_map[compressed_block_id] = new_position
+        else:  # read position from recursive oram
+            data = self.read_recursively(compressed_block_id, recursive_level, oram_server)
+
+            # get position of target block from packed data
+            block_size = self.blocks_size[recursive_level]
+            if len(data) % block_size != 0:
+                raise Exception("unexpected length of data read", "length of data", len(data), "block size", block_size)
+            found = False
+            position = ''
+            data_to_write = None
+            for i in range(0, len(data) // block_size):
                 block = data[i * block_size:(i + 1) * block_size]
                 read_block_id = int.from_bytes(block[:self.block_id_size], byteorder='little')
                 if read_block_id != block_id:
@@ -116,18 +148,17 @@ class RecursivePathOramClient:
                 found = True
                 position = block[self.block_id_size:block_size].decode()
                 new_position_data = block_id.to_bytes(self.block_id_size, byteorder='little') + new_position.encode()
-                data_to_write = data[:i * block_size] + new_position_data + data[(i + 1) * block_size]
+                data_to_write = data[:i * block_size] + new_position_data + data[(i + 1) * block_size:]
                 break
             if not found:
                 raise Exception("position should be found")
-            self.write_recursively(compressed_block_id, data_to_write, recursive_level + 1, oram_server)
+            self.write_recursively(compressed_block_id, data_to_write, recursive_level, oram_server)
             # write new position
-
         return position
 
     def access(self, op, block_id, block_data, recursive_level, oram_server):
-        print("recursive level", recursive_level, "all recursive level", self.recursive_level)
-        block_position = self.lookup_position(block_id, recursive_level, oram_server)
+        # print("recursive level",recursive_level)
+        block_position = self.lookup_position(block_id, recursive_level + 1, oram_server)
         # read bucket along path block_position from server
         blocks_cipher = oram_server.read(block_position, recursive_level)
         to_append_stash = dict()
@@ -140,8 +171,11 @@ class RecursivePathOramClient:
 
         # update stash
         self.stash[recursive_level].update(to_append_stash)
-
+        # print("stash:",self.stash[recursive_level],"recusieve level",recursive_level)
         if block_id not in self.stash[recursive_level]:
+            if recursive_level != 0:
+                # not first level, must exists
+                raise Exception("position must exists in position oram")
             # not write before
             data_to_read = None
         else:
@@ -150,7 +184,6 @@ class RecursivePathOramClient:
                 data_to_read = self.remove_dummy_in_block(block_plaintext_to_read.data)
             else:
                 data_to_read = block_plaintext_to_read.data
-        print("data to read", data_to_read)
         if op == 'write':
             if recursive_level == 0:  # only padding for file block
                 block_size = self.blocks_size[0]
@@ -159,23 +192,8 @@ class RecursivePathOramClient:
                     raise Exception("length of block data should be less than block size", "length of block data:",
                                     len(block_data), "block size:", block_size)
                 block_data = block_data + (self.blocks_size[0] - len(block_data)) * self.block_dummy_symbol
-            else:
-                found = False
-                block_size = self.blocks_size[recursive_level]
-                data_to_write = None
-                to_replace_block_id = int.from_bytes(block_data[:self.block_id_size], byteorder='little')
-                for i in range(0, len(data_to_read), block_size):
-                    block = data_to_read[i * block_size:(i + 1) * block_size]
-                    read_block_id = int.from_bytes(block[:self.block_id_size], byteorder='little')
-                    if read_block_id != to_replace_block_id:
-                        continue
-                    found = True
-                    data_to_write = data_to_read[:i * block_size] + block_data + data_to_read[(i + 1) * block_size:]
-                    break
-                if not found:
-                    raise Exception("position should be found")
 
-                self.stash[recursive_level][block_id] = BlockPlaintext(block_id, data_to_write)
+            self.stash[recursive_level][block_id] = BlockPlaintext(block_id, block_data)
 
         for l in reversed(range(self.levels[recursive_level] + 1)):
             intersect_block = self.find_intersection_block(block_position, l, recursive_level, oram_server)
@@ -208,7 +226,6 @@ class RecursivePathOramClient:
                     dummy_blocks_cipher.append(dummy_block_cipher)
                 select_blocks_cipher.extend(dummy_blocks_cipher)
             oram_server.write_bucket(block_position, select_blocks_cipher, l, recursive_level)
-
         return data_to_read
 
     def remove_dummy_in_block(self, data):
@@ -262,74 +279,39 @@ class RecursivePathOramClient:
         oram_buckets.append(buckets)
         position_buckets = self.generate_initialize_position_block()
         oram_buckets.extend(position_buckets)
-        return oram_buckets
 
-    def calculate_leaf_node_index(self, recursive_level):
-        level = self.levels[recursive_level]
-        leaf_nodes = pow(2, level)
-        leaf_node_index = []
-        for i in range(leaf_nodes):
-            position = self.integer_to_position(i, recursive_level)
-            index = 0
-            for j in range(len(position)):
-                if position[j] == '0':
-                    index = 2 * index + 1
-                elif position[j] == '1':
-                    index = 2 * index + 2
-                else:
-                    raise Exception("unexpected position")
-            leaf_node_index.append(index)
-        return leaf_node_index
+        return oram_buckets
 
     def generate_initialize_position_block(self):
         level_buckets = []
-        # for first level position map, generate randomly
-        first_level_position_data = []
-        first_level = self.levels[0]
-        first_level_leaf_nodes = pow(2, first_level)
-        first_buckets_blocks = [[self.generate_dummy_block_cipher(0)] * self.Z for k in
-                                range(pow(2, first_level + 1) - 1)]
-
-        for i in range(first_level_leaf_nodes):
-            block_id = i.to_bytes(self.block_id_size, byteorder='little')
-            position = self.integer_to_position(i, 0).encode()
-            data = block_id + position
-            first_level_position_data.append(data)
-        first_level_position_blocks = []
-        for i in range(0, first_level_leaf_nodes, self.position_compress):
-            packed_data = b''.join(
-                first_level_position_data[i * self.position_compress:(i + 1) * self.position_compress])
-            packed_block = BlockPlaintext(i, packed_data)
-            first_level_position_blocks.append(packed_block)
-
-        leaf_nodes_index = self.calculate_leaf_node_index(1)
-        for i, index in enumerate(leaf_nodes_index):
-            first_buckets_blocks[index][0] = first_level_position_blocks[i]
-
-        first_buckets = []
-        for i in range(pow(2, first_level + 1) - 1):
-            first_buckets.append(Bucket(first_buckets_blocks[i]))
-        level_buckets.append(first_buckets)
-        # for middle levels
-        for i in range(1, self.recursive_level):
+        for i in range(1, self.recursive_level + 1):
+            level = self.levels[i]
             middle_buckets_blocks = [[self.generate_dummy_block_cipher(i)] * self.Z for k in
-                                     range(pow(2, first_level + 1) - 1)]
+                                     range(pow(2, level + 1) - 1)]
             level = self.levels[i]
             leaf_nodes = pow(2, level)
             level_position_data = []
-            for j in range(leaf_nodes):
+
+            previous_leaf_nodes = pow(2, self.levels[i - 1])
+            for j in range(previous_leaf_nodes):
                 block_id = j.to_bytes(self.block_id_size, byteorder='little')
-                position = self.integer_to_position(j, i).encode()
+                position = self.integer_to_position(j, i - 1).encode()
                 data = block_id + position
                 level_position_data.append(data)
-            for j in range(0, leaf_nodes, self.position_compress):
+            level_position_blocks = []
+            for j in range(0, leaf_nodes):
                 packed_data = b''.join(level_position_data[j * self.position_compress:(j + 1) * self.position_compress])
                 packed_block = BlockPlaintext(j, packed_data)
-                level_position_data.append(packed_block)
+                packed_block_cipher = self.encrypt_block(packed_block)
+                level_position_blocks.append(packed_block_cipher)
 
-            leaf_nodes_index = self.calculate_leaf_node_index(i + 1)
+            leaf_nodes_index = range(leaf_nodes - 1, leaf_nodes * 2 - 1)
+
+            if len(leaf_nodes_index) != len(level_position_blocks):
+                raise Exception("unexpected wrong", len(leaf_nodes_index))
+
             for j, index in enumerate(leaf_nodes_index):
-                middle_buckets_blocks[index][0] = level_position_data[i]
+                middle_buckets_blocks[index][0] = level_position_blocks[j]
 
             middle_buckets = []
             for j in range(pow(2, level + 1) - 1):
@@ -347,9 +329,14 @@ class RecursivePathOramClient:
         block_size = self.blocks_size[recursive_level]
         dummy_block = self.block_dummy_symbol * block_size
         dummy_block_id = int.from_bytes(dummy_block[:self.block_id_size], byteorder='little')
-        dummy_data = dummy_block[self.block_id_size: block_size]
-        block_cipher = self.encrypt_block(
-            BlockPlaintext(dummy_block_id, dummy_data))
+        if recursive_level == 0:
+            dummy_data = dummy_block[self.block_id_size: block_size]
+            block_cipher = self.encrypt_block(
+                BlockPlaintext(dummy_block_id, dummy_data))
+        else:
+            block_cipher = self.encrypt_block(
+                BlockPlaintext(dummy_block_id, dummy_block * self.position_compress)
+            )
         return block_cipher
 
     # change loc from 0 - 2^ level - 1 to a binary position representation in a tree (e.g. '00101')

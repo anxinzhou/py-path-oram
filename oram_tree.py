@@ -52,9 +52,9 @@ class OramTree:
         target_index = 0
         for i in range(len(position)):
             if position[i] == '0':  # turn left
-                target_index = 2 * i + 1
+                target_index = 2 * target_index + 1
             elif position[i] == '1':  # turn right
-                target_index = 2 * i + 2
+                target_index = 2 * target_index + 2
             else:
                 raise Exception("position should only be 0,1 string")
             target_bucket = self.buckets[target_index]
@@ -69,9 +69,9 @@ class OramTree:
         target_index = 0
         for i in range(level):
             if position[i] == '0':  # turn left
-                target_index = 2 * i + 1
-            elif position[i] == '1':  # turn rightddasd
-                target_index = 2 * i + 2
+                target_index = 2 * target_index + 1
+            elif position[i] == '1':  # turn right
+                target_index = 2 * target_index + 2
             else:
                 raise Exception("position should only be 0,1 string")
         target_bucket = self.buckets[target_index]
