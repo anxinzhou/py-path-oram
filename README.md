@@ -59,3 +59,19 @@ For 1000 files.  (1000 files from imdb dataset)
 The initialization time (Need a full binary tree with level 10)  is 3.05 s.
 The average write time is 0.033s.
 The average read time is 0.034s.
+
+## For Recursive Path oram
+
+No much difference from non-recursive path oram except store position map recursively.
+
+### Performance
+
+Currently, very slow... 
+
+For 500 files
+The average read time is 2.78s.
+The average write time is 2.25s.
+
+For 1000 files
+The average read time is 11.67s.
+The average write time is 15.93s.
